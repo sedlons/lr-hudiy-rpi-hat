@@ -193,6 +193,10 @@ void input_read(void) {
 }
 /*------------------------------------------------------------------------------------------------------*/
 /* Receive data from serial port */
+/*
+ * Priklad: N,30,60,4\n
+ * N - Rpi se vypne, 30min bufik on, 60min off, 4x
+ */
 void parse_received_line(char *buf) {
   unsigned int auxOn,auxOff,auxCycles;
   char * strtokIndx; /* This is used by strtok() as an index */
