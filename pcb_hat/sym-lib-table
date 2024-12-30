@@ -1,0 +1,5 @@
+(sym_lib_table
+  (lib (name "raspberrypi-gpio-40pin-rescue")(type "Legacy")(uri "${KIPRJMOD}/raspberrypi-gpio-40pin-rescue.lib")(options "")(descr ""))
+  (lib (name "projectLibrary")(type "KiCad")(uri "${KIPRJMOD}/projectLibrary.kicad_sym")(options "")(descr ""))
+  (lib (name "ifx54441ejv50")(type "KiCad")(uri "${KIPRJMOD}/ifx54441ejv50.kicad_sym")(options "")(descr ""))
+)
