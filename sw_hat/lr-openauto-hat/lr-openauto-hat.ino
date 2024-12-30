@@ -57,15 +57,22 @@ struct {
     unsigned int oil_press;
     unsigned int steer_whl;   /* Analog value from steering wheel buttons */
   } analog;
+  struct {
+    bool webasto_on_rpi_off;
+    bool webasto_on_rpi_on;
+    unsigned int webasto_set_on; /* On time in minutes */
+    unsigned int webasto_set_off; /* Off time in minutes */
+    unsigned int webasto_set_cycles; /* Number of ON cycles */
+  } remote;
 } state;
 /*------------------------------------------------------------------------------------------------------*/
 /* Settings */
 struct {
-  int shutdown_delay_rpi;      /* sec */    /* Shutdown of RPi delay after IGN off */
+  int shutdown_delay_cmdRpi;      /* sec */    /* Poweroff command for RPi delay after IGN off */
+  int shutdown_delay_pwrRpi;      /* sec */    /* Shutdown of RPi delay after IGN off */
   int shutdown_delay_arduino;  /* sec */    /* Shutdown of Arduino delay after IGN off */
   float light_sensor_filter;
   float steer_whl_filter;
-
 } settings;
 /*------------------------------------------------------------------------------------------------------*/
 /* Pre fill threshold values etc. based on button resistance array */
@@ -125,7 +132,8 @@ void setup() {
   /* DEFAULT Settings */
     /* TODO: Move to eeprom */
   settings.shutdown_delay_arduino    = 5 * 60; /* 5 minutes */
-  settings.shutdown_delay_rpi        = 2 * 60; /* 2 minutes MUST BE LOWER THAN shutdown_delay_arduino */
+  settings.shutdown_delay_pwrRpi     = 4 * 60; /* 4 minutes MUST BE LOWER THAN shutdown_delay_arduino */
+  settings.shutdown_delay_cmdRpi     = 2 * 60; /* 2 minutes MUST BE LOWER THAN shutdown_delay_pwrRpi */
   settings.light_sensor_filter       = 0.005f; /* Light sensor analog value filter (0.0 - 1.0) */
   settings.steer_whl_filter          = 0.05f;
 
@@ -183,25 +191,119 @@ void input_read(void) {
   /* Light sensor */
   state.analog.steer_whl = settings.steer_whl_filter * (float)analogRead(PIN_STEER_WHL) + (1.0f - settings.steer_whl_filter) * state.analog.steer_whl;
 }
+/*------------------------------------------------------------------------------------------------------*/
+/* Receive data from serial port */
+void parse_received_line(char *buf) {
+  unsigned int auxOn,auxOff,auxCycles;
+  char * strtokIndx; /* This is used by strtok() as an index */
 
+  Serial.println(buf);
+  char cmd = buf[0];
+
+  strtokIndx = strtok(buf,",");      /* Jump over first cmd part */
+ 
+  strtokIndx = strtok(NULL, ","); // this continues where the previous call left off
+  auxOn = atoi(strtokIndx);
+
+  strtokIndx = strtok(NULL, ",");
+  auxOff = atoi(strtokIndx);
+
+  strtokIndx = strtok(NULL, ",");
+  auxCycles = atoi(strtokIndx);
+
+  /* Validity check */
+  if (auxOn  < 5    ||
+      auxOff < 5    ||
+      auxOn  > 3600 ||
+      auxOff > 3600) {
+    Serial.println("Warning: Time must be between 5 and 3600 minutes");
+    return;
+  }
+
+  if(auxCycles < 1 || auxCycles > 20) {
+    Serial.println("Warning: Cycles must be between 1 and 20");
+    return;    
+  }
+
+  switch(cmd) {
+    case 'N': //Night heating
+      state.remote.webasto_on_rpi_off = true;
+      Serial.print("Webasto night mode ON");
+      break;
+    case 'M': //Movie with heating
+      state.remote.webasto_on_rpi_on = true;
+      Serial.print("Webasto movie mode ON");
+      break;
+    default:
+      Serial.println("Warning: Unknown command");
+      return;
+  }
+
+  state.remote.webasto_set_on = auxOn;
+  state.remote.webasto_set_off = auxOff;
+  state.remote.webasto_set_cycles = auxCycles;
+
+  Serial.print(" - On:");
+  Serial.print(state.remote.webasto_set_on, DEC);
+  Serial.print("min, Off:");
+  Serial.print(state.remote.webasto_set_off, DEC);
+  Serial.print("min, On:");
+  Serial.print(state.remote.webasto_set_cycles, DEC);
+  Serial.println("x");
+}
+/*------------------------------------------------------------------------------------------------------*/
+/* Receive data from serial port */
+void remote_receive_serial(void) {
+  const byte buffLen = 32; /* Size of receive serial buffer (for each line) */
+  static char receivedChars[buffLen];   /* An array to store the received data */
+
+  static byte ndx = 0;
+  char endMarker = '\n'; /* 0x0D-CarriageReturn  0x0A-NewLine  */
+  char rc;
+    
+  while (Serial.available() > 0) {
+  rc = Serial.read();
+    if (rc != endMarker) {
+      receivedChars[ndx] = rc;
+      ndx++;
+      if (ndx >= buffLen) {
+        ndx = buffLen - 1;
+      }
+    } else {
+      receivedChars[ndx] = '\0'; // terminate the string
+      ndx = 0;
+
+      /* Parse received line */
+      parse_received_line(receivedChars);
+    }
+  }
+}
 /*------------------------------------------------------------------------------------------------------*/
 /*  TASKS  */
 /* Simplest tasking is used - every task must return quickly as posible. */
 /*------------------------------------------------------------------------------------------------------*/
 /* Arduino power managment */
 void task_arduino_pwr(void) {
-  if(state.in.ignition != HIGH) {
-    int timeS = (millis() - state.timestamps.last_ignition_change) / 1000;
-    TASK_PERIOD(,1000 /* ms */) {
+  if(state.in.ignition != HIGH) { /* Ignition off */
+    unsigned long timeS = (millis() - state.timestamps.last_ignition_change) / 1000;
+
+    /* Just leave arduino pwr on during movie watching */
+    if(state.remote.webasto_on_rpi_on || state.remote.webasto_on_rpi_off) {
+      return;
+    }
+
+    TASK_PERIOD(shArd,1000 /* ms */) {
       Serial.print("Shutdown in ");
       Serial.println(settings.shutdown_delay_arduino - timeS, DEC);
     }
+    
     if(timeS > settings.shutdown_delay_arduino) {
-      digitalWrite(PIN_PWR_LATCH, LOW);
       Serial.println("Cutting arduino PWR...");
-      while(1);
+      while(1){ /* Cycle end forever */
+        digitalWrite(PIN_PWR_LATCH, LOW);
+      }
     }
-  } else {
+  } else { /* Ignition on */
     if(millis() - state.timestamps.last_ignition_change > 50) {
       /* Print text only when change */
       if(state.out.rpi_pwr_en != HIGH) {
@@ -214,11 +316,26 @@ void task_arduino_pwr(void) {
 /*------------------------------------------------------------------------------------------------------*/
 /* RPi power managment */
 void task_rpi_pwr(void) {
+  /* Just leave rpi during movie watching */
+  if(state.remote.webasto_on_rpi_on) {
+    return;
+  }
+  
+  /* Turn off rpi, if ignition off and Pi already on */
   if(state.in.ignition != HIGH && state.out.rpi_pwr_en != LOW) {
-    if(millis() - state.timestamps.last_ignition_change > (unsigned long)settings.shutdown_delay_rpi*1000ul) {
-      Serial.println("RPi power OFF");
+    int timeS = (millis() - state.timestamps.last_ignition_change) / 1000;
+
+    /* Send command to RPI for software off */
+    if(timeS > settings.shutdown_delay_cmdRpi) {
+      TASK_PERIOD(shRpi,3000 /* ms */) {
+        Serial.println("RPi power OFF");
+      }
+    }
+
+    /* Cut off power */
+    if(timeS > settings.shutdown_delay_pwrRpi) {
       pinMode(PIN_RPI_PWR_EN, OUTPUT);
-      //state.out.rpi_pwr_en = LOW;
+      state.out.rpi_pwr_en = LOW;
       delay(150);
       pinMode(PIN_RPI_PWR_EN, INPUT);
     }
@@ -268,6 +385,56 @@ void task_communication(void) {
   
 }
 /*------------------------------------------------------------------------------------------------------*/
+/*  */
+void task_webasto_heating(void) {
+  static bool isPause = false; /* True if off cycle */
+  static int ccycle = 0; /* Current cycle */
+
+  static unsigned long webOnLastTime=0;
+  static unsigned long webOffLastTime=0;  
+
+  /* Do nothing if on is not set */
+  if(!(state.remote.webasto_on_rpi_on || state.remote.webasto_on_rpi_off)) {
+    state.out.webasto = LOW;
+    ccycle = 0;
+    isPause = false;
+    return;
+  }
+
+  /* If first cycle, init time variables, ... */
+  if(ccycle == 0) {
+    ccycle=1;
+    webOnLastTime = millis();
+    webOffLastTime = millis();
+  }
+
+  /* Main webasto timer control */
+  if(isPause) {
+    state.out.webasto = LOW;
+    for(;millis() - webOffLastTime > 1000ul*60ul*state.remote.webasto_set_off; webOffLastTime=millis()) {
+      //ccycle++;
+      webOnLastTime = millis();
+      isPause = false;
+    }
+  } else {
+    state.out.webasto = HIGH;
+    for(;millis() - webOnLastTime > 1000ul*60ul*state.remote.webasto_set_on; webOnLastTime=millis()) {
+      ccycle++;
+      webOffLastTime = millis();
+      isPause = true;
+    }
+  }
+
+  /* Last cycle, turn off all */
+  if(ccycle > state.remote.webasto_set_cycles) {
+    state.remote.webasto_on_rpi_on = false;
+    state.remote.webasto_on_rpi_off = false;
+    state.out.webasto = LOW;
+    isPause = false;
+    ccycle = 0;
+  }
+}
+/*------------------------------------------------------------------------------------------------------*/
 /* Just Arduino onboard led blinking - shared with D13 ! */
 void task_led_blink(void) {
 static int last = HIGH;
@@ -286,7 +453,15 @@ static int last = HIGH;
 /* Writing outputs, serial outputs, etc. */
 /*------------------------------------------------------------------------------------------------------*/
 void output_write(void) {
+  /* Rpi power */
   digitalWrite(PIN_RPI_PWR_EN, state.out.rpi_pwr_en);
+  /* Webasto control */
+  digitalWrite(PIN_WEBASTO, state.out.webasto);
+
+  TASK_PERIOD(outInfo,1000 /* ms */) {
+    Serial.print("Webasto: ");
+    Serial.println((state.out.webasto) ? "ON" : "Off");
+  }
 }
 
 /*------------------------------------------------------------------------------------------------------*/
@@ -302,6 +477,7 @@ void loop() {
   WDTCSR = (1 << WDIE) | (1 << WDE) | (1 << WDP3) | (1 << WDP0);
   
   input_read();
+  remote_receive_serial();
   
   task_arduino_pwr();
   task_rpi_pwr();
@@ -310,6 +486,7 @@ void loop() {
   task_oil_pressure();
   task_ilumination();
   task_communication();
+  task_webasto_heating();
   task_led_blink();
   
   output_write();
