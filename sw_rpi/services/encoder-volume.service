@@ -1,0 +1,18 @@
+[Unit]
+Description=Control volume with encoder
+After=sound.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/pi/hudiy-discovery2/encoder-volume/encoder-volume
+WorkingDirectory=/home/pi/hudiy-discovery2/encoder-volume
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+RestartSec=5
+
+User=pi
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=multi-user.target

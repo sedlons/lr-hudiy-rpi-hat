@@ -1,0 +1,18 @@
+[Unit]
+Description=HUDIY car interface with Arduino
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/pi/hudiy-discovery2/hudiy-car-interface/hudiy-car-interface.py
+WorkingDirectory=/home/pi/hudiy-discovery2/hudiy-car-interface
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+RestartSec=5
+
+User=pi
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=multi-user.target

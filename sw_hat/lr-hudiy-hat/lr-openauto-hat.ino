@@ -7,12 +7,38 @@
  *
  */
 
+/*
+   * Power control:
+   *  There is 12 V from battery and ignition signal. When ignition is turned on, it power up arduino. 
+   *  Arduino then set power latch to HIGH for keeping device powered on even if the ignition is off.
+   *  Arduino after this turn on power for RPi.
+   *  When ignition is turned off, rpi should handle this signal and do "poweroff" after some delay (e.g. few minutes) and
+   *  after much longer delay (more than rpi needs for power off), arduino shutdown whole device by seting power latch to LOW.
+   *  Anytime ignition is turned on, RPi must be also turned on.
+   * 
+   * Ligh sensor:
+   *  Just read analog value and send it to RPi python script.
+   * 
+   * Wheel buttons:
+   *  Just read analog value, do some filtering and send to RPi.
+   *   
+   * Reverse camera:
+   *  Read reverse input state and send the to RPi.
+   *   
+   * Webasto heating:
+   *  Timing webasto run with time values set by RPi. Threeway valve also can be controlled.
+   *  - Obtain values from RPi. RPi must do immediately 'poweroff' after receiving heating is on.
+   *  - After some delay (same as in Power control) shutsdown RPi.
+   *  - Arduino run heating cycles. After all cycles shutsdown whole device.
+   * 
+*/
+
 #include <avr/wdt.h>
 
 /* Input/output/analog pin definitions */
 #define PIN_D4           4  /* */
 #define PIN_RPI_PWR_EN   5  /* output-enable rpi power */
-#define PIN_ILUM         6  /* */
+#define PIN_REVERSE      6  /* Reverse gear indicator. On PCB is marked as ILUM, but day/night is  not controlled by light sensor */
 #define PIN_PWR_LATCH    7  /* output-latching power */
 #define PIN_WEBASTO      8  /* */
 #define PIN_THR_VALVE    9  /* */
@@ -26,24 +52,19 @@
 #define PIN_LIGHT_SENS   A3 /* */
 #define PIN_DS1307_SDA   A4 /* */
 #define PIN_DS1307_SCL   A5 /* */
-#define PIN_A6           A6 /* */
+//#define PIN_A6           A6 /* */
 #define PIN_AAUX         A7 /* */
 
-/*------------------------------------------------------------------------------------------------------*/
-/*  MACRO's  */
-/*------------------------------------------------------------------------------------------------------*/
-/* Simple period */
-#define TASK_PERIOD(__NAME__, __PERIOD__) static unsigned long __NAME__##LastTime=0; for(;millis() - __NAME__##LastTime > __PERIOD__; __NAME__##LastTime=millis())
-/* Defining wheel button resistance */
-#define WHEEL_BTN_RES(__RES__) {__RES__, 0, 0}
 /*------------------------------------------------------------------------------------------------------*/
 /*  VARIABLES - GLOBAL  */
 /*------------------------------------------------------------------------------------------------------*/
 /* State variable */
 struct {
   struct {
-    int ignition;          /* State of ignition pin */
-    int steer_whl_btn;     /* Steering wheel button reconstructed from analog value */
+    bool ignition;            /* State of ignition pin */
+    bool reverse_gear;        /* Reverse gear engaged */
+    unsigned int light_sens;  /* Snalog value - ambient light */
+    unsigned int steer_whl;   /* Analog value from steering wheel buttons */
   } in;
   struct {
     int rpi_pwr_en;
@@ -53,13 +74,7 @@ struct {
     unsigned long last_ignition_change;
   } timestamps;
   struct {
-    unsigned int light_sens;
-    unsigned int oil_press;
-    unsigned int steer_whl;   /* Analog value from steering wheel buttons */
-  } analog;
-  struct {
-    bool webasto_on_rpi_off;
-    bool webasto_on_rpi_on;
+    bool webasto_on;
     unsigned int webasto_set_on; /* On time in minutes */
     unsigned int webasto_set_off; /* Off time in minutes */
     unsigned int webasto_set_cycles; /* Number of ON cycles */
@@ -67,34 +82,10 @@ struct {
 } state;
 /*------------------------------------------------------------------------------------------------------*/
 /* Settings */
-struct {
-  int shutdown_delay_cmdRpi;      /* sec */    /* Poweroff command for RPi delay after IGN off */
-  int shutdown_delay_pwrRpi;      /* sec */    /* Shutdown of RPi delay after IGN off */
-  int shutdown_delay_arduino;  /* sec */    /* Shutdown of Arduino delay after IGN off */
-  float light_sensor_filter;
-  float steer_whl_filter;
-} settings;
-/*------------------------------------------------------------------------------------------------------*/
-/* Pre fill threshold values etc. based on button resistance array */
-void setup_steering_wheel_button_calc(void);
-/* Steering wheel buttons struct for distinction */
-typedef struct wheel_btn{ 
-  float ohm;  /* Button resistor value in ohm */
-  int lthr;   /* AD value - low threshold */
-  int ad;     /* AD value (0-1024) */
-  int hthr;   /* AD value - upper threshold */
-} wheel_btn;
-/* Array of structs with steering wheel resistances. Must be in ascending order */
-wheel_btn resistances[] = {
-  /* 0 - volume down */ WHEEL_BTN_RES(0),         
-  /* 1 - volume up */   WHEEL_BTN_RES(390),       
-  /* 2 - search up */   WHEEL_BTN_RES(390 + 470),   
-  /* 3 - search down */ WHEEL_BTN_RES(390 + 470 + 820),
-  /* 4 - mode */        WHEEL_BTN_RES(390 + 470 + 820 + 1000),
-  /* 5 - end */         WHEEL_BTN_RES(390 + 470 + 820 + 1000 + 1000),
-};
-/* Length of resistances */
-const int resistance_len = sizeof(resistances) / sizeof(wheel_btn);
+#define POWERCUT_DELAY_RPI        (5*60) /* sec */
+#define POWERCUT_DELAY_ARDUINO    (POWERCUT_DELAY_RPI + 2*60) /* sec - must be higher than RPi delay ! */
+#define FILTER_LIGHT_SENSOR       0.005f /* low pass filter (0.0 - 1.0) */
+#define FILTER_STEERINGWHEEL_BTN  0.2f   /* low pass filter (0.0 - 1.0) */
 /*------------------------------------------------------------------------------------------------------*/
 /*  SETUP  */
 /*------------------------------------------------------------------------------------------------------*/
@@ -106,68 +97,38 @@ void setup() {
 
   /* Clear all state variables */
   memset(&state, 0, sizeof(state));
-
-  /* Configure outputs */
-  pinMode(PIN_RPI_PWR_EN, INPUT);
-  //digitalWrite(PIN_RPI_PWR_EN, HIGH);
+ 
+  /* When ignition is turned ON, RPi is immediately powerd ON by diode beween pins D12 and D5. Unless pin PIN_RPI_PWR_EN is keep LOW.
+   * So, arduino can be programmed and restarted/reseted, while RPi is still ON.
+   */
+  digitalWrite(PIN_RPI_PWR_EN, HIGH);
+  pinMode(PIN_RPI_PWR_EN, OUTPUT); 
+  digitalWrite(PIN_RPI_PWR_EN, HIGH);
+  state.out.rpi_pwr_en = HIGH; /* RPi on after system poweron */
   
+  /* Threeway valve output */
   pinMode(PIN_THR_VALVE, OUTPUT);
   digitalWrite(PIN_THR_VALVE, LOW);
-  
+
+  /* Webasto */
   pinMode(PIN_WEBASTO, OUTPUT);
   digitalWrite(PIN_WEBASTO, LOW);
   
   pinMode(LED_BUILTIN, OUTPUT);
 
   /* Configure inputs */
-  pinMode(PIN_ILUM, INPUT);
+  pinMode(PIN_REVERSE, INPUT);
   pinMode(PIN_IGNITION, INPUT);
-  //pinMode(PIN_STEER_WHL, INPUT);
   pinMode(PIN_OIL_PRESS, INPUT);
-  //pinMode(PIN_LIGHT_SENS, INPUT);
 
   /* USB to serial port for debuging */
   Serial.begin(115200);
-
-  /* DEFAULT Settings */
-    /* TODO: Move to eeprom */
-  settings.shutdown_delay_arduino    = 5 * 60; /* 5 minutes */
-  settings.shutdown_delay_pwrRpi     = 4 * 60; /* 4 minutes MUST BE LOWER THAN shutdown_delay_arduino */
-  settings.shutdown_delay_cmdRpi     = 2 * 60; /* 2 minutes MUST BE LOWER THAN shutdown_delay_pwrRpi */
-  settings.light_sensor_filter       = 0.005f; /* Light sensor analog value filter (0.0 - 1.0) */
-  settings.steer_whl_filter          = 0.05f;
-
-  setup_steering_wheel_button_calc();
 
   /* Say hello */
   Serial.println("lr-openauto-hat v1.0");
 
   wdt_enable(WDTO_4S);
 }
-/*------------------------------------------------------------------------------------------------------*/
-void setup_steering_wheel_button_calc(void) {
-  /* Onboard pullup resistor value */
-  const float res_R9 = 4300; /* ohm */
-  
-  /* Prefill */
-  for (int i = 0; i < resistance_len; i++) {
-    resistances[i].ad = 1024.0f * resistances[i].ohm / (resistances[i].ohm + res_R9);
-    
-    float part = 0.1*(float)resistances[i].ad;
-    resistances[i].lthr = resistances[i].ad - part;
-    resistances[i].hthr = resistances[i].ad + part;
-
-    Serial.print("Steering wheel disctinction:");
-    Serial.print((int)resistances[i].ohm, DEC); 
-    Serial.print(": "); 
-    Serial.print(resistances[i].lthr, DEC);
-    Serial.print("<");
-    Serial.print(resistances[i].ad, DEC);
-    Serial.print(">"); 
-    Serial.println(resistances[i].hthr, DEC);
-  }
-}
-
 /*------------------------------------------------------------------------------------------------------*/
 /*  INPUT read  */
 /* Input read with debouncing etc. */
@@ -177,25 +138,22 @@ void input_read(void) {
   if(digitalRead(PIN_IGNITION) != state.in.ignition) {
     state.in.ignition = digitalRead(PIN_IGNITION);
     state.timestamps.last_ignition_change = millis();
-    Serial.print("Ignition: ");
-    if(state.in.ignition) {
-      Serial.println("on");  
-    } else {
-      Serial.println("off");  
-    }
   }
 
-  /* Light sensor */
-  state.analog.light_sens = settings.light_sensor_filter * (float)analogRead(PIN_LIGHT_SENS) + (1.0f - settings.light_sensor_filter) * state.analog.light_sens;
+  /* Reverse gear engaged */
+  state.in.reverse_gear = digitalRead(PIN_REVERSE);
 
   /* Light sensor */
-  state.analog.steer_whl = settings.steer_whl_filter * (float)analogRead(PIN_STEER_WHL) + (1.0f - settings.steer_whl_filter) * state.analog.steer_whl;
+  state.in.light_sens = FILTER_LIGHT_SENSOR * (float)analogRead(PIN_LIGHT_SENS) + (1.0f - FILTER_LIGHT_SENSOR) * state.in.light_sens;
+
+  /* Steering wheel buttons */
+  state.in.steer_whl = FILTER_STEERINGWHEEL_BTN * (float)analogRead(PIN_STEER_WHL) + (1.0f - FILTER_STEERINGWHEEL_BTN) * state.in.steer_whl;
 }
 /*------------------------------------------------------------------------------------------------------*/
 /* Receive data from serial port */
 /*
- * Priklad: N,30,60,4\n
- * N - Rpi se vypne, 30min bufik on, 60min off, 4x
+ * Example: N,30,60,4\n
+ * N - Rpi off, 30min webasto on, 60min off, 4x
  */
 void parse_received_line(char *buf) {
   unsigned int auxOn,auxOff,auxCycles;
@@ -231,12 +189,8 @@ void parse_received_line(char *buf) {
 
   switch(cmd) {
     case 'N': //Night heating
-      state.remote.webasto_on_rpi_off = true;
+      state.remote.webasto_on = true;
       Serial.print("Webasto night mode ON");
-      break;
-    case 'M': //Movie with heating
-      state.remote.webasto_on_rpi_on = true;
-      Serial.print("Webasto movie mode ON");
       break;
     default:
       Serial.println("Warning: Unknown command");
@@ -291,17 +245,12 @@ void task_arduino_pwr(void) {
   if(state.in.ignition != HIGH) { /* Ignition off */
     unsigned long timeS = (millis() - state.timestamps.last_ignition_change) / 1000;
 
-    /* Just leave arduino pwr on during movie watching */
-    if(state.remote.webasto_on_rpi_on || state.remote.webasto_on_rpi_off) {
+    /* Keep arduino pwr on during heating */
+    if(state.remote.webasto_on) {
       return;
     }
-
-    TASK_PERIOD(shArd,1000 /* ms */) {
-      Serial.print("Shutdown in ");
-      Serial.println(settings.shutdown_delay_arduino - timeS, DEC);
-    }
     
-    if(timeS > settings.shutdown_delay_arduino) {
+    if(timeS > POWERCUT_DELAY_ARDUINO) {
       Serial.println("Cutting arduino PWR...");
       while(1){ /* Cycle end forever */
         digitalWrite(PIN_PWR_LATCH, LOW);
@@ -309,10 +258,6 @@ void task_arduino_pwr(void) {
     }
   } else { /* Ignition on */
     if(millis() - state.timestamps.last_ignition_change > 50) {
-      /* Print text only when change */
-      if(state.out.rpi_pwr_en != HIGH) {
-        Serial.println("RPi power ON"); 
-      }
       state.out.rpi_pwr_en = HIGH;
     }    
   }
@@ -320,73 +265,15 @@ void task_arduino_pwr(void) {
 /*------------------------------------------------------------------------------------------------------*/
 /* RPi power managment */
 void task_rpi_pwr(void) {
-  /* Just leave rpi during movie watching */
-  if(state.remote.webasto_on_rpi_on) {
-    return;
-  }
-  
-  /* Turn off rpi, if ignition off and Pi already on */
+  /* Turn off RPi, if ignition off and RPi still on */
   if(state.in.ignition != HIGH && state.out.rpi_pwr_en != LOW) {
     int timeS = (millis() - state.timestamps.last_ignition_change) / 1000;
 
-    /* Send command to RPI for software off */
-    if(timeS > settings.shutdown_delay_cmdRpi) {
-      TASK_PERIOD(shRpi,3000 /* ms */) {
-        Serial.println("RPi power OFF");
-      }
-    }
-
     /* Cut off power */
-    if(timeS > settings.shutdown_delay_pwrRpi) {
-      pinMode(PIN_RPI_PWR_EN, OUTPUT);
+    if(timeS > POWERCUT_DELAY_RPI) {
       state.out.rpi_pwr_en = LOW;
-      delay(150);
-      pinMode(PIN_RPI_PWR_EN, INPUT);
     }
   }  
-}
-/*------------------------------------------------------------------------------------------------------*/
-/*  */
-void task_light_sensor(void) {
-  TASK_PERIOD(,1000 /* ms */) {
-    Serial.print("Light sens: ");
-    Serial.println(state.analog.light_sens, DEC);
-  }
-}
-/*------------------------------------------------------------------------------------------------------*/
-/*  */
-void task_steering_wheel(void) {
-  /* Send button info every x ms */
-  TASK_PERIOD(btnsense, 200) {
-    for(int i = 0; i < resistance_len; i++) {
-      if(resistances[i].lthr >= state.analog.steer_whl && state.analog.steer_whl <= resistances[i].hthr) {
-        Serial.print("Steer wheel btn: ");
-        Serial.println(i, DEC);        
-        break;
-      }
-    }
-  }
-  
-  TASK_PERIOD(text,1000 /* ms */) {
-    Serial.print("Steer wheel sens: ");
-    Serial.println(state.analog.steer_whl, DEC);
-  }
-  
-}
-/*------------------------------------------------------------------------------------------------------*/
-/*  */
-void task_oil_pressure(void) {
-  
-}
-/*------------------------------------------------------------------------------------------------------*/
-/*  */
-void task_ilumination(void) {
-  
-}
-/*------------------------------------------------------------------------------------------------------*/
-/*  */
-void task_communication(void) {
-  
 }
 /*------------------------------------------------------------------------------------------------------*/
 /*  */
@@ -398,7 +285,7 @@ void task_webasto_heating(void) {
   static unsigned long webOffLastTime=0;  
 
   /* Do nothing if on is not set */
-  if(!(state.remote.webasto_on_rpi_on || state.remote.webasto_on_rpi_off)) {
+  if(state.remote.webasto_on == false) {
     state.out.webasto = LOW;
     ccycle = 0;
     isPause = false;
@@ -431,8 +318,7 @@ void task_webasto_heating(void) {
 
   /* Last cycle, turn off all */
   if(ccycle > state.remote.webasto_set_cycles) {
-    state.remote.webasto_on_rpi_on = false;
-    state.remote.webasto_on_rpi_off = false;
+    state.remote.webasto_on = false;
     state.out.webasto = LOW;
     isPause = false;
     ccycle = 0;
@@ -441,15 +327,17 @@ void task_webasto_heating(void) {
 /*------------------------------------------------------------------------------------------------------*/
 /* Just Arduino onboard led blinking - shared with D13 ! */
 void task_led_blink(void) {
-static int last = HIGH;
-  TASK_PERIOD(,150 /* ms */) {
+  static int last = HIGH;
+  static unsigned long LastTime=0; 
+  
+  for(;millis() - LastTime > 250 /* ms */; LastTime=millis()) {
     digitalWrite(LED_BUILTIN, last);
     if(last == HIGH) {
       last = LOW;
     } else {
       last = HIGH;
     }  
-  } /* TASK_PERIOD_END */
+  }
 }
 
 /*------------------------------------------------------------------------------------------------------*/
@@ -458,13 +346,28 @@ static int last = HIGH;
 /*------------------------------------------------------------------------------------------------------*/
 void output_write(void) {
   /* Rpi power */
-  digitalWrite(PIN_RPI_PWR_EN, state.out.rpi_pwr_en);
+  digitalWrite(PIN_RPI_PWR_EN, state.out.rpi_pwr_en);    
+
   /* Webasto control */
   digitalWrite(PIN_WEBASTO, state.out.webasto);
 
-  TASK_PERIOD(outInfo,1000 /* ms */) {
-    Serial.print("Webasto: ");
-    Serial.println((state.out.webasto) ? "ON" : "Off");
+  static unsigned long printLastTime=0; 
+  for(;millis() - printLastTime > 25 /* ms */; printLastTime=millis()) {
+    /* */
+    Serial.print("STATES IGN:");
+    Serial.print(state.in.ignition);
+  
+    Serial.print(" LSENS:");
+    Serial.print(state.in.light_sens);
+
+    Serial.print(" WHBTN:");
+    Serial.print(state.in.steer_whl);
+
+    Serial.print(" HEATER:");
+    Serial.print(state.remote.webasto_on);
+
+    Serial.print(" REVERSE:");
+    Serial.println(state.in.reverse_gear);
   }
 }
 
@@ -485,11 +388,7 @@ void loop() {
   
   task_arduino_pwr();
   task_rpi_pwr();
-  task_light_sensor();
-  task_steering_wheel();
-  task_oil_pressure();
-  task_ilumination();
-  task_communication();
+
   task_webasto_heating();
   task_led_blink();
   
