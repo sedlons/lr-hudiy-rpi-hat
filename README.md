@@ -1,4 +1,4 @@
-## li-hudiy-rpi-hat
+## lr-hudiy-rpi-hat
 RPi hat suitable for HUDIY. I used it in Land Rover Discovery II.
 
 ![PCB](PCB.png)

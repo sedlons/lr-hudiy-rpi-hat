@@ -3,7 +3,7 @@ Description=Control volume with encoder
 After=sound.target
 
 [Service]
-ExecStart=/usr/bin/python3 /home/pi/hudiy-discovery2/encoder-volume/encoder-volume
+ExecStart=/usr/bin/python3 /home/pi/hudiy-discovery2/encoder-volume/encoder-volume-pw.py
 WorkingDirectory=/home/pi/hudiy-discovery2/encoder-volume
 StandardOutput=inherit
 StandardError=inherit
