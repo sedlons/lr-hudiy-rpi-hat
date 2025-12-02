@@ -1,0 +1,9 @@
+{
+  "roll_alert_blink": 35,
+  "roll_alert_red": 40,
+  "pitch_alert_blink": 35,
+  "pitch_alert_red": 40,
+  "zero_roll": 2.3,
+  "zero_pitch": -8.5
+}
+

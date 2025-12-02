@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Offroad Tilt HUD</title>
+<style>
+@font-face {
+  font-family: "RobotoLocal";
+  src: url("file:///home/pi/.hudiy/share/assets/fonts/Roboto-Regular.ttf") format("truetype");
+  font-weight: 400;
+}
+@font-face {
+  font-family: "RobotoLocal";
+  src: url("file:///home/pi/.hudiy/share/assets/fonts/Roboto-Bold.ttf") format("truetype");
+  font-weight: 700;
+}
+
+/* ---------- Theme- / Typo-Variablen ---------- */
+:root {
+  --label-color: #c8c8c8;
+  --value-color: #ffffff;
+  --color-primary: #ffffff;
+  --color-neutral: #ffffff;
+
+  --label-size: 24px;
+  --label-weight: 400;
+  --label-lh: 1.2;
+
+  --value-size: 24px;
+  --value-weight: 700;
+  --unit-weight: 400;
+  --value-lh: 1.1;
+
+  --row-gap: 0.8em;
+  --value-gap: 0.25em;
+  --container-pad: 0.8rem;
+
+  --minmax-size: 18px;
+  --minmax-weight: 400;
+  --minmax-color: #bdbdbd;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background: transparent;
+  font-family: "RobotoLocal", system-ui, sans-serif;
+}
+
+#container {
+  margin-top: 1px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  transition: background-color 0.2s;
+  padding: 1rem;
+}
+
+#values {
+  display: flex;
+  gap: 2rem;
+  font-family: monospace;
+  font-size: 32px;
+  font-weight: 700;
+  color: var(--label-color);
+}
+
+.label {
+  font-size: var(--label-size);
+  color: var(--label-color);
+  font-weight: var(--label-weight);
+  line-height: var(--label-lh);
+  letter-spacing: 0;
+  text-align: center;
+}
+
+.roll-bar {
+  width: calc(100% - 1px);
+  height: 35px;
+  background: transparent;
+  border-radius: 20px;
+  border: 2px solid var(--color-neutral);
+  overflow: hidden;
+  position: relative;
+}
+
+.roll-fill {
+  height: 100%;
+  background: var(--color-primary);
+  width: 0%;
+  border-radius: 20px 0 0 20px;
+  transition: width 0.1s linear, background-color 0.1s;
+}
+
+@keyframes blink {
+  0%,50%,100%{background-color:red;}
+  25%,75%{background-color:transparent;}
+}
+.blink {animation: blink 1s infinite;}
+</style>
+</head>
+<body>
+<div id="container">
+  <div id="values">
+    <div>
+      <div class="label">Roll</div>
+      <div id="v-roll">+0.0°</div>
+    </div>
+    <div>
+      <div class="label">Pitch</div>
+      <div id="v-pitch">+0.0°</div>
+    </div>
+  </div>
+
+  <div class="roll-bar">
+    <div class="roll-fill" id="roll-fill"></div>
+  </div>
+</div>
+
+<script>
+
+// ------- Hudiy Theme Hook -------
+(function setupHudiyTheme() {
+  window.hudiy = window.hudiy || {};
+  const apply = () => {
+    const cs = hudiy.colorScheme || {};
+    document.documentElement.style.setProperty('--label-color', cs.onSurface || '#c8c8c8');
+    document.documentElement.style.setProperty('--value-color', cs.primary   || '#ffffff');
+    document.documentElement.style.setProperty('--color-primary', cs.primaryPaletteKeyColor || '#ff0000');
+    document.documentElement.style.setProperty('--color-neutral', cs.neutralPaletteKeyColor || '#ffffff');
+  };
+  const prevAttach = hudiy.onAttached;
+  hudiy.onAttached = () => { try { prevAttach && prevAttach(); } catch {} apply(); };
+  hudiy.onColorSchemeChanged = apply;
+  apply();
+})();
+
+const WS_URL = "ws://127.0.0.1:8765";
+let ws;
+
+function formatTilt(v) {
+  return (v >= 0 ? "+" : "") + Number(v).toFixed(1);
+}
+
+function connectWS() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => console.log("WS connected");
+  ws.onclose = () => setTimeout(connectWS, 500);
+  ws.onerror = (err) => { console.error("WS error:", err); ws.close(); };
+  ws.onmessage = (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+
+      if (data.roll !== undefined) document.getElementById("v-roll").textContent = formatTilt(data.roll) + "°";
+      if (data.pitch !== undefined) document.getElementById("v-pitch").textContent = formatTilt(data.pitch) + "°";
+
+      const container = document.getElementById("container");
+      const rollFill = document.getElementById("roll-fill");
+
+      // Handle alerts
+      if (data.roll_alert === "red" || data.pitch_alert === "red") {
+        container.classList.remove("blink");
+        container.style.backgroundColor = "red";
+        rollFill.style.backgroundColor = "#ff0000";
+      } else if (data.roll_alert === "blink" || data.pitch_alert === "blink") {
+        container.classList.add("blink");
+        container.style.backgroundColor = "";
+        rollFill.style.backgroundColor = "#ff8800";
+      } else {
+        container.classList.remove("blink");
+        container.style.backgroundColor = "transparent";
+        rollFill.style.backgroundColor = getComputedStyle(document.documentElement).getPropertyValue('--color-primary');
+      }
+
+      // Update roll bar (absolute value)
+      if (data.roll !== undefined) {
+        const maxTilt = 35;
+        let percent = Math.min(Math.abs(data.roll) / maxTilt, 1) * 100;
+        rollFill.style.width = percent + "%";
+      }
+
+    } catch (e) {
+      console.warn("Invalid WS message", e);
+    }
+  };
+}
+
+connectWS();
+</script>
+</body>
+</html>
+
+
