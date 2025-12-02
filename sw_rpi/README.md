@@ -4,6 +4,9 @@ Install protobuf, websocket, websockets:
 sudo apt install python3-protobuf python3-websocket python3-websocket
 
 ## Inlinometer plugin 
+
+[![Example](https://img.youtube.com/vi/qAAtmSkTd4U/0.jpg)](https://www.youtube.com/watch?v=qAAtmSkTd4U)
+
 This plugin can be configured in settings.json. It is posible to set two alert values. When alert is on, whole 
 html on hudiy blinks red / or stay completly red.
 
